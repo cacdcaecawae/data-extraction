@@ -198,6 +198,16 @@ TABLE_RANK_HEADERS = {
 }
 TABLE_RANK_ACCEPT = {"1", "第一名", "第一", "冠军"}
 
+# 审查表的特征（这些表格不应该提取供应商名称）
+REVIEW_TABLE_HEADERS = {
+    "资格性审查",
+    "符合性审查",
+    "是否通过资格性审查",
+    "是否通过符合性审查",
+    "资格审查",
+    "符合性审查结果",
+}
+
 
 @dataclass
 class FieldValue:
@@ -715,6 +725,21 @@ class ProcurementExtractor:
         # 跟踪采购单位和代理机构的名称,用于判断地址归属
         last_name_field = None  # 最近遇到的名称字段类型
         
+        # 检查这个表格是否是综合得分排名表（包含"得分排名"列）
+        is_ranking_table = False
+        # 检查这个表格是否是审查表（资格性审查或符合性审查）
+        is_review_table = False
+        for row in rows:
+            row_clean = [cell if cell is not None else "" for cell in row]
+            for cell in row_clean:
+                cell_norm = normalize_label_text(cell)
+                if cell_norm in {normalize_label_text(x) for x in TABLE_RANK_HEADERS}:
+                    is_ranking_table = True
+                if cell_norm in {normalize_label_text(x) for x in REVIEW_TABLE_HEADERS}:
+                    is_review_table = True
+            if is_ranking_table and is_review_table:
+                break
+        
         for row_idx, row in enumerate(rows):
             # 过滤掉None值
             row = [cell if cell is not None else "" for cell in row]
@@ -729,16 +754,23 @@ class ProcurementExtractor:
                             break
                     continue
             if header_map:
-                if ranking_idx is not None and ranking_idx < len(row):
+                # 如果是排名表，只处理排名为1的行
+                if is_ranking_table and ranking_idx is not None and ranking_idx < len(row):
                     rank_norm = normalize_label_text(row[ranking_idx])
                     if rank_norm not in {normalize_label_text(x) for x in TABLE_RANK_ACCEPT}:
                         continue
+                
                 for idx, field in header_map.items():
                     if idx < len(row):
                         value = row[idx]
                         
                         if label_to_field(value):
                             continue
+                        
+                        # 如果是审查表，跳过供应商名称和供应商地址的提取
+                        if is_review_table and field in {"供应商名称", "供应商地址"}:
+                            continue
+                        
                         # 记录原始值,用于调试
                         original_value = value
                         # 特殊处理:"采购标的"字段的智能识别
