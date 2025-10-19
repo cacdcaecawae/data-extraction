@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Batch extract 8 core procurement indicators from HTML announcements,
-and export the results to CSV / JSONL files.
+and export the results to CSV / JSONL / XLSX files.
 """
 from __future__ import annotations
 
@@ -19,6 +19,8 @@ from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from bs4 import BeautifulSoup
 from bs4.element import NavigableString, Tag
 from dateutil import parser as date_parser
+from openpyxl import Workbook
+from openpyxl.styles import Font
 
 LOGGER = logging.getLogger("extract_html_procurement")
 
@@ -54,6 +56,12 @@ FIELD_DEFINITIONS: Sequence[Dict] = (
             "成交金额",
             "采购人联系人",
             "采购人联系电话",
+            "采购单位联系方式",
+            "采购人联系方式",
+            "联系方式",
+            "联系电话",
+            "项目联系人",
+            "项目联系电话",
             "遴选专家名单",
             "行政区域",
         ),
@@ -72,6 +80,7 @@ FIELD_DEFINITIONS: Sequence[Dict] = (
             "采购人联系方式",
             "代理机构名称",
             "代理机构地址",
+            "代理机构",
             "附件",
         ),
         fallback=(r"(采购人地址|采购单位地址)[:：]?\s*([^\n\r]{2,160})",),
@@ -108,9 +117,16 @@ FIELD_DEFINITIONS: Sequence[Dict] = (
     dict(
         name="采购类别",
         aliases=("采购类别", "采购类型", "采购方式", "项目类别", "品目"),
-        multi=True,
+        multi=False,  # 改为单一值
         stopwords=(),
         fallback=(r"(采购类别|采购方式|项目类别|品目)[:：]?\s*([^\n\r]{1,80})",),
+    ),
+    dict(
+        name="采购标的",
+        aliases=("采购标的", "标的名称", "采购内容", "标的"),
+        multi=False,
+        stopwords=("品牌", "规格型号", "数量", "总价"),
+        fallback=(r"(采购标的|标的名称|采购内容)[:：]?\s*([^\n\r]{2,120})",),
     ),
 )
 
@@ -122,6 +138,30 @@ FULL_TEXT_PATTERNS: Dict[str, Sequence[re.Pattern]] = {
     item["name"]: tuple(re.compile(pattern) for pattern in item["fallback"]) if item["fallback"] else ()
     for item in FIELD_DEFINITIONS
 }
+
+SUPPLIER_SCORE_TOKENS = (
+    "公司",
+    "有限",
+    "集团",
+    "中心",
+    "医院",
+    "大学",
+    "学院",
+    "学校",
+    "研究",
+    "科技",
+    "股份",
+    "合作社",
+    "政府",
+    "委员会",
+    "事务所",
+    "厂",
+    "站",
+    "局",
+)
+ADDRESS_SCORE_TOKENS = ("省", "市", "区", "县", "镇", "乡", "街", "路", "道", "大道", "村", "楼", "栋", "层", "单元", "室", "号")
+LOCATION_SUFFIXES = ("省", "市", "区", "县", "镇", "乡", "街", "道", "大道", "办", "园")
+ADMIN_LOCATION_SUFFIXES = ("省", "市", "区", "县", "镇", "乡")
 
 CATEGORY_KEYWORDS = {
     "货物": ("货物", "设备", "物资", "用品", "耗材"),
@@ -229,22 +269,129 @@ def normalize_text_for_regex(text: str) -> str:
 
 
 def cleanup_field_value(field: str, value: str) -> str:
-    cleaned = value.strip(" ：；，。")
-    for stopword in FIELD_STOPWORDS.get(field, ()):
-        idx = cleaned.find(stopword)
-        if idx != -1:
-            cleaned = cleaned[:idx]
-    for sep in ("：", ":"):
-        if sep in cleaned:
-            left, right = cleaned.split(sep, 1)
-            if left.strip() and right.strip():
-                cleaned = left
+    strip_chars = " 、。，；:"
+    cleaned = value.strip(strip_chars)
+    
+    # 对于采购单位地址，先检查是否包含"代理机构"等关键词
+    if field == "采购单位地址":
+        # 如果包含代理机构相关关键词，直接过滤掉
+        if re.search(r"(代理机构|招标代理|采购代理|中介机构)", cleaned):
+            return ""
+    
+    # 对于项目名称和采购标的，不使用停止词过滤和冒号分割
+    if field not in ("项目名称", "采购标的"):
+        for stopword in FIELD_STOPWORDS.get(field, ()):
+            idx = cleaned.find(stopword)
+            if idx != -1:
+                cleaned = cleaned[:idx]
+    
+    # 对于项目名称和采购标的，不按冒号分割
+    if field not in ("项目名称", "采购标的"):
+        for sep in ("：", ":"):
+            if sep in cleaned:
+                left, right = cleaned.split(sep, 1)
+                if left.strip() and right.strip():
+                    cleaned = left
+                    break
+    if field == "供应商名称":
+        if any(token in cleaned for token in ("比例", "权重", "得分", "%")):
+            if not re.search(r"(公司|有限|集团|中心|医院|大学|学院|学校|研究|科技|股份|合作社|政府|委员会|事务所|厂|站|局)", cleaned):
+                cleaned = ""
+    if field in {"供应商地址", "采购单位地址"}:
+        for separator in ("；", ";"):
+            idx = cleaned.find(separator)
+            if idx != -1:
+                cleaned = cleaned[:idx]
                 break
     if field == "采购单位名称":
-        idx = cleaned.find("行政区域")
+        idx = cleaned.find("联系方式")
         if idx != -1:
             cleaned = cleaned[:idx]
-    return cleaned.strip(" ：；，。")
+        # 过滤掉电话号码（包含数字且以特定模式开头）
+        if re.match(r"^[\d\-\s]+$", cleaned) or re.match(r"^0\d{2,3}[-\s]?\d{7,8}$", cleaned):
+            cleaned = ""
+        # 过滤掉纯数字或看起来像电话号码的内容
+        if cleaned and len(cleaned) < 20 and re.search(r"\d{7,}", cleaned) and not re.search(r"[\u4e00-\u9fa5]{2,}", cleaned):
+            cleaned = ""
+    
+    # 注意：项目名称保留完整内容，不做额外清理
+    
+    return cleaned.strip(strip_chars)
+
+
+def extract_location_tokens(text: str) -> Set[str]:
+    tokens: Set[str] = set()
+    if not text:
+        return tokens
+    for suffix in LOCATION_SUFFIXES:
+        pattern = rf"[^\s\d]{{1,6}}{suffix}"
+        for match in re.finditer(pattern, text):
+            token = match.group(0)
+            suffix_len = len(suffix)
+            prefix_len = max(1, min(2, len(token) - suffix_len))
+            trimmed = token[-(suffix_len + prefix_len):]
+            tokens.add(trimmed)
+    return tokens
+
+
+def score_field_value(field: Optional[str], value: str, reference: str = "") -> int:
+    if not value:
+        return 0
+    cleaned = value.strip()
+    if not cleaned:
+        return 0
+    score = len(cleaned)
+    
+    # 对于项目名称，更长更完整的标题得分更高（包含项目编号和公告类型的版本）
+    if field == "项目名称":
+        # 如果包含"项目编号"，给予额外加分
+        if "项目编号" in cleaned or "编号" in cleaned:
+            score += 50
+        # 如果包含公告类型，给予额外加分
+        if re.search(r"(中标|成交|结果)公告", cleaned):
+            score += 30
+    
+    if re.search(r"(详见|另行|暂未|待定|--|见公告|见附件|无)", cleaned):
+        score -= 20
+    
+    # 对于采购标的字段,如果包含版本号、型号等特征,降低分数
+    # 因为这更可能是规格型号而不是标的名称
+    if field == "采购标的":
+        # 检测是否包含版本号、型号等特征
+        if re.search(r'(V\d+\.\d+|版本|型号|简称[:：]|规格[:：]|\[|\]|（.*?版.*?）)', cleaned):
+            score -= 100  # 大幅降低分数,避免规格型号覆盖标的名称
+    
+    if field in {"供应商地址", "采购单位地址"}:
+        for token in ADDRESS_SCORE_TOKENS:
+            if token in cleaned:
+                score += 3
+        if re.search(r"\d", cleaned):
+            score += 3
+    if field in {"供应商地址", "采购单位地址"} and reference:
+        reference_tokens = extract_location_tokens(reference)
+        if reference_tokens:
+            candidate_tokens = extract_location_tokens(cleaned)
+            matches = candidate_tokens & reference_tokens
+            if matches:
+                bonus = 20 if field == "采购单位地址" else 10
+                score += bonus * len(matches)
+            if field == "采购单位地址" and candidate_tokens:
+                mismatches = {
+                    token
+                    for token in candidate_tokens
+                    if token not in reference_tokens and token[-1] in ADMIN_LOCATION_SUFFIXES
+                }
+                if mismatches:
+                    score -= 6 * len(mismatches)
+    if field == "供应商名称":
+        for token in SUPPLIER_SCORE_TOKENS:
+            if token in cleaned:
+                score += 4
+    if field == "采购单位名称":
+        for token in ("局", "委", "院", "中心", "办", "公司", "集团", "学校", "医院", "大学", "政府", "管理"):
+            if token in cleaned:
+                score += 2
+    return score
 
 
 def normalize_date_text(value: str) -> Optional[str]:
@@ -260,6 +407,7 @@ def normalize_date_text(value: str) -> Optional[str]:
     candidate = match.group(0) if match else text
     try:
         dt = date_parser.parse(candidate, dayfirst=False, yearfirst=True, fuzzy=True)
+        # 统一格式：个位数补0
         return f"{dt.year:04d}年{dt.month:02d}月{dt.day:02d}日"
     except (ValueError, OverflowError):
         return None
@@ -292,10 +440,21 @@ def normalize_amounts(raw: str) -> List[str]:
 def extract_categories(raw: str) -> List[str]:
     if not raw:
         return []
-    text = normalize_whitespace(raw).lower()
+    # 移除空格，处理"货物"和"类"被分隔的情况
+    text = re.sub(r'\s+', '', raw).lower()
     detected: List[str] = []
+    # 先检查明确的类别标识（如"货物类"、"服务类"、"工程类"）
+    if "货物类" in text:
+        return ["货物"]
+    if "服务类" in text:
+        return ["服务"]
+    if "工程类" in text:
+        return ["工程"]
+    
+    # 如果没有找到明确的类别标识，再使用关键词匹配
+    text_with_space = normalize_whitespace(raw).lower()
     for category, keywords in CATEGORY_KEYWORDS.items():
-        if any(keyword.lower() in text for keyword in keywords):
+        if any(keyword.lower() in text_with_space for keyword in keywords):
             detected.append(category)
     return detected
 
@@ -304,11 +463,37 @@ def label_to_field(label: str) -> Optional[str]:
     normalized = normalize_label_text(label)
     if not normalized:
         return None
+    best_field: Optional[str] = None
+    best_score = 0
     for field, aliases in FIELD_KEYWORDS.items():
         for alias in aliases:
-            if normalize_label_text(alias) in normalized:
-                return field
-    return None
+            alias_norm = normalize_label_text(alias)
+            if not alias_norm:
+                continue
+            if normalized == alias_norm:
+                score = len(alias_norm) + 100
+            elif alias_norm in normalized:
+                score = len(alias_norm)
+            elif normalized in alias_norm:
+                # 只有当标签也包含别名时才匹配（太宽松，容易误匹配）
+                # 例如："地址" in "采购单位地址" 会匹配，但我们不希望单独的"地址"被映射
+                # 解决方案：对于地址字段，要求必须包含"采购"或"供应商"等前缀
+                if field in {"采购单位地址", "供应商地址"}:
+                    # 检查原始标签是否包含必要的前缀
+                    if field == "采购单位地址":
+                        if not ("采购" in label or "采购人" in label):
+                            # 不匹配单独的"地址"、"地 址"等
+                            continue
+                    elif field == "供应商地址":
+                        if not ("供应商" in label or "中标供应商" in label or "成交供应商" in label):
+                            continue
+                score = len(normalized)
+            else:
+                continue
+            if score > best_score:
+                best_field = field
+                best_score = score
+    return best_field
 
 
 class ProcurementExtractor:
@@ -326,6 +511,8 @@ class ProcurementExtractor:
     def add_field(self, field: str, raw_value: str) -> None:
         if field not in self.fields or not raw_value:
             return
+        field_store = self.fields[field]
+        
         if field == "公告时间":
             normalized = normalize_date_text(raw_value)
             values = [normalized] if normalized else []
@@ -336,8 +523,25 @@ class ProcurementExtractor:
         else:
             cleaned = cleanup_field_value(field, normalize_whitespace(raw_value))
             values = [cleaned] if cleaned else []
+        reference = ""
+        if field == "采购单位地址":
+            name_entries = self.fields["采购单位名称"].entries
+            if name_entries:
+                reference = name_entries[0][1]
+        elif field == "供应商地址":
+            supplier_entries = self.fields["供应商名称"].entries
+            if supplier_entries:
+                reference = supplier_entries[0][1]
         for value in values:
-            self.fields[field].add(value, self._next_order())
+            if field_store.entries and not field_store.multi:
+                existing_value = field_store.entries[0][1]
+                existing_score = score_field_value(field, existing_value, reference)
+                candidate_score = score_field_value(field, value, reference)
+                
+                if candidate_score > existing_score:
+                    field_store.entries[0] = (self._next_order(), value.strip())
+                continue
+            field_store.add(value, self._next_order())
 
     def _extract_meta_nodes(self) -> None:
         meta_title = self.soup.find("meta", attrs={"name": re.compile(r"^ArticleTitle$", re.I)})
@@ -358,8 +562,23 @@ class ProcurementExtractor:
             self._walk_dom(body)
         self._apply_full_text_patterns()
         result = {field: value.get() for field, value in self.fields.items()}
-        if not result["采购类别"]:
-            result["采购类别"] = "其他"
+        
+        # 特殊处理采购类别：优先从全文中查找"货物类"、"服务类"、"工程类"
+        # 移除空格处理被分隔的情况（如"货物"和"类"在不同的span中）
+        full_text_no_space = re.sub(r'\s+', '', self.full_text)
+        if not result["采购类别"] or result["采购类别"] == "其他":
+            # 在全文中查找明确的类别标识（移除空格版本）
+            if "货物类" in full_text_no_space:
+                result["采购类别"] = "货物"
+            elif "服务类" in full_text_no_space:
+                result["采购类别"] = "服务"
+            elif "工程类" in full_text_no_space:
+                result["采购类别"] = "工程"
+            else:
+                # 如果没有找到明确的类别，保持原值或设为"其他"
+                if not result["采购类别"]:
+                    result["采购类别"] = "其他"
+        
         return result
 
     def _walk_dom(self, node: Tag) -> None:
@@ -397,7 +616,18 @@ class ProcurementExtractor:
                 skip_next = True
             else:
                 merged.append(line)
+        
+        # 标记是否在代理机构相关区域
+        in_agency_section = False
+        
         for segment in merged:
+            # 检测是否进入代理机构信息区域（更宽松的匹配）
+            if re.search(r"(代理机构|采购代理|招标代理|中介机构)", segment):
+                in_agency_section = True
+            # 如果再次出现采购人信息或项目联系，则退出代理机构区域
+            if re.search(r"(采购人信息|采购单位信息|项目联系|其他补充|附件)", segment) and "代理" not in segment:
+                in_agency_section = False
+            
             for candidate in re.split(r"[；;]", segment):
                 candidate = candidate.strip()
                 if not candidate:
@@ -426,16 +656,68 @@ class ProcurementExtractor:
                             if field:
                                 value = alt_value
                     if field:
+                        # 如果是采购单位地址字段，且在代理机构区域，跳过
+                        if field == "采购单位地址" and in_agency_section:
+                            continue
+                        
                         self.add_field(field, value)
 
     def _extract_table(self, table: Tag) -> None:
-        rows = [
-            [normalize_whitespace(cell.get_text(separator=" ", strip=True)) for cell in tr.find_all(["th", "td"])]
-            for tr in table.find_all("tr")
-        ]
+        # 重写表格解析逻辑,正确处理rowspan/colspan
+        trs = table.find_all("tr")
+        # 构建完整的表格矩阵,处理rowspan和colspan
+        matrix: List[List[Optional[str]]] = []
+        cell_sources: List[List[Optional[int]]] = []  # 记录每个单元格来自哪一行(用于调试)
+        
+        for row_idx, tr in enumerate(trs):
+            cells = tr.find_all(["th", "td"])
+            if row_idx >= len(matrix):
+                matrix.append([])
+                cell_sources.append([])
+            
+            col_idx = 0
+            for cell in cells:
+                # 跳过被前面的rowspan占用的列
+                while col_idx < len(matrix[row_idx]) and matrix[row_idx][col_idx] is not None:
+                    col_idx += 1
+                
+                # 获取单元格的文本内容
+                cell_text = normalize_whitespace(cell.get_text(separator=" ", strip=True))
+                
+                # 获取rowspan和colspan属性
+                rowspan = int(cell.get("rowspan", 1))
+                colspan = int(cell.get("colspan", 1))
+                
+                # 填充当前单元格及其跨越的区域
+                for r in range(rowspan):
+                    target_row = row_idx + r
+                    # 确保目标行存在
+                    while len(matrix) <= target_row:
+                        matrix.append([])
+                        cell_sources.append([])
+                    # 确保目标行足够长
+                    while len(matrix[target_row]) <= col_idx + colspan - 1:
+                        matrix[target_row].append(None)
+                        cell_sources[target_row].append(None)
+                    
+                    # 填充跨越的列
+                    for c in range(colspan):
+                        matrix[target_row][col_idx + c] = cell_text
+                        cell_sources[target_row][col_idx + c] = row_idx
+                
+                col_idx += colspan
+        
+        # 现在matrix包含了正确对齐的表格数据
+        rows = matrix
         header_map: Dict[int, str] = {}
         ranking_idx: Optional[int] = None
-        for row in rows:
+        
+        # 跟踪采购单位和代理机构的名称,用于判断地址归属
+        last_name_field = None  # 最近遇到的名称字段类型
+        
+        for row_idx, row in enumerate(rows):
+            # 过滤掉None值
+            row = [cell if cell is not None else "" for cell in row]
             candidate_map = {idx: label_to_field(cell) for idx, cell in enumerate(row)}
             candidate_map = {idx: field for idx, field in candidate_map.items() if field}
             if not header_map and candidate_map:
@@ -454,8 +736,49 @@ class ProcurementExtractor:
                 for idx, field in header_map.items():
                     if idx < len(row):
                         value = row[idx]
+                        
                         if label_to_field(value):
                             continue
+                        # 记录原始值,用于调试
+                        original_value = value
+                        # 特殊处理:"采购标的"字段的智能识别
+                        if field == "采购标的":
+                            # 检查是否包含通用模板描述（这些通常不是真正的标的名称）
+                            generic_patterns = [
+                                r'按.*[《<].*招标.*文件.*[》>].*要求.*执行',
+                                r'按.*[《<].*投标.*文件.*[》>].*执行',
+                                r'详见.*文件',
+                                r'详见.*公告',
+                                r'见.*附件'
+                            ]
+                            is_generic = any(re.search(pattern, value) for pattern in generic_patterns)
+                            
+                            if is_generic or (len(value.strip()) <= 4 and not re.search(r'(系统|设备|服务|工程|项目|采购|建设)', value)):
+                                # 尝试查找同行中更合适的值（优先选择包含项目关键词的列）
+                                best_alt_value = None
+                                best_score = 0
+                                
+                                for alt_idx in range(len(row)):
+                                    if alt_idx != idx and alt_idx not in header_map:
+                                        alt_value = row[alt_idx].strip()
+                                        if not alt_value or alt_value == value:
+                                            continue
+                                        
+                                        # 计算候选值的得分
+                                        score = len(alt_value)
+                                        if re.search(r'(系统|设备|服务|工程|项目|采购|建设|平台|软件|硬件)', alt_value):
+                                            score += 20
+                                        # 排除看起来像通用描述的值
+                                        if any(re.search(p, alt_value) for p in generic_patterns):
+                                            score = 0
+                                        
+                                        if score > best_score:
+                                            best_score = score
+                                            best_alt_value = alt_value
+                                
+                                if best_alt_value:
+                                    value = best_alt_value
+                        
                         self.add_field(field, value)
             if len(row) >= 2:
                 if ranking_idx is not None and ranking_idx < len(row):
@@ -463,9 +786,30 @@ class ProcurementExtractor:
                     if rank_norm not in {normalize_label_text(x) for x in TABLE_RANK_ACCEPT}:
                         continue
                 for idx in range(0, len(row) - 1, 2):
-                    field = label_to_field(row[idx])
+                    label_text = row[idx]
+                    value_text = row[idx + 1]
+                    field = label_to_field(label_text)
+                    
                     if field:
-                        self.add_field(field, row[idx + 1])
+                        # 检查标签文本本身是否包含"代理"关键词
+                        label_has_agency = "代理" in label_text
+                        
+                        # 跟踪当前处理的是采购单位还是代理机构
+                        if field == "采购单位名称" and not label_has_agency:
+                            last_name_field = "purchaser"
+                        elif label_has_agency or "代理机构" in label_text:
+                            last_name_field = "agency"
+                        
+                        # 对于地址字段的特殊处理
+                        if field == "采购单位地址":
+                            # 1. 如果标签本身包含"代理"，跳过
+                            if label_has_agency:
+                                continue
+                            # 2. 如果最近处理的是代理机构名称，跳过
+                            if last_name_field == "agency":
+                                continue
+                        
+                        self.add_field(field, value_text)
 
     def _apply_full_text_patterns(self) -> None:
         for field, patterns in FULL_TEXT_PATTERNS.items():
@@ -507,16 +851,62 @@ def write_outputs(records: Sequence[Dict[str, str]], output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     csv_path = output_dir / "extracted.csv"
     jsonl_path = output_dir / "extracted.jsonl"
+    xlsx_path = output_dir / "extracted.xlsx"
 
+    # 写入CSV文件
     with csv_path.open("w", newline="", encoding="utf-8-sig") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=list(FIELD_ORDER))
         writer.writeheader()
         for record in records:
-            writer.writerow({field: record.get(field, "") for field in FIELD_ORDER})
+            # 为"公告时间"字段使用Excel公式格式,防止Excel自动格式化去掉前导0
+            # 格式: ="2021年05月24日",Excel会显示为文本且不显示公式符号
+            row_data = {}
+            for field in FIELD_ORDER:
+                value = record.get(field, "")
+                if field == "公告时间" and value:
+                    # 使用Excel文本公式格式,保留前导0且不显示公式
+                    value = f'="{value}"'
+                row_data[field] = value
+            writer.writerow(row_data)
 
+    # 写入JSONL文件
     with jsonl_path.open("w", encoding="utf-8") as jsonl_file:
         for record in records:
             jsonl_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+    
+    # 写入XLSX文件(Excel原生格式,完美支持文本格式的日期)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "采购信息"
+    
+    # 写入表头(加粗)
+    header_font = Font(bold=True)
+    for col_idx, field in enumerate(FIELD_ORDER, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=field)
+        cell.font = header_font
+    
+    # 写入数据行
+    for row_idx, record in enumerate(records, start=2):
+        for col_idx, field in enumerate(FIELD_ORDER, start=1):
+            value = record.get(field, "")
+            cell = ws.cell(row=row_idx, column=col_idx, value=value)
+            # 将"公告时间"列设置为文本格式,保留前导0
+            if field == "公告时间":
+                cell.number_format = '@'  # '@'表示文本格式
+    
+    # 自动调整列宽
+    for col_idx, field in enumerate(FIELD_ORDER, start=1):
+        # 根据字段名长度和内容估算列宽
+        max_length = len(field)
+        for row_idx in range(2, min(len(records) + 2, 100)):  # 只检查前100行
+            cell_value = ws.cell(row=row_idx, column=col_idx).value
+            if cell_value:
+                max_length = max(max_length, len(str(cell_value)))
+        # 设置列宽(Excel列宽单位与字符数不完全一致,需要微调)
+        adjusted_width = min(max_length + 2, 60)  # 最大60个字符宽度
+        ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = adjusted_width
+    
+    wb.save(xlsx_path)
 
 
 def main() -> None:
@@ -540,4 +930,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
