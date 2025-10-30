@@ -9,10 +9,11 @@ import json
 import logging
 import sys
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
-
+from datetime import datetime
+import time
 from openpyxl import Workbook
 from openpyxl.styles import Font
 
@@ -78,7 +79,9 @@ if absl_logging is not None:
 @dataclass
 class PipelineConfig:
     input_dir: Path = Path("./data1")
-    output_dir: Path = Path("./results")
+    output_dir: Path = field(
+        default_factory=lambda: Path("./result") / datetime.now().strftime("%Y%m%d_%H%M%S")
+    )
     extraction_passes: int = 1
     max_char_buffer: int = 2400
     max_workers: int = 5
@@ -92,6 +95,8 @@ class PipelineConfig:
     drop_empty_lines: bool = True
     table_cell_sep: str = " | "
     fail_silently: bool = False
+    default_model_id: str = "gemini-2.5-flash"
+    use_custom_model: bool = False
 
 
 CONFIG = PipelineConfig()
@@ -104,8 +109,10 @@ class PipelineStats:
     failed: int = 0
 
 
-def configure_model(lx_module: Any) -> Any:
+def configure_model(lx_module: Any, config: PipelineConfig) -> Optional[Any]:
     """返回 DeepSeek 模型包装。"""
+    if not config.use_custom_model:
+        return None
     if OpenAILanguageModel is None:
         raise RuntimeError("未安装 langextract，请先执行：pip install langextract")
     return OpenAILanguageModel(
@@ -133,15 +140,6 @@ def build_prompt(lx_module: Any) -> Tuple[str, Sequence[Any]]:
     ]
     example = lx_module.data.ExampleData(text=example_text, extractions=example_extractions)
     return prompt, [example]
-
-
-def iter_valid_extractions(document: Any) -> Iterable[Any]:
-    """仅返回与原文对齐的抽取，过滤掉 few-shot 示例。"""
-    for extraction in getattr(document, "extractions", []) or []:
-        if getattr(extraction, "char_interval", None) is None:
-            continue
-        yield extraction
-
 
 class ProgressBar:
     """在终端打印简单的进度条。"""
@@ -179,33 +177,59 @@ class LangExtractPipeline:
     def __init__(self, lx_module: Any, config: PipelineConfig):
         self.lx = lx_module
         self.config = config
-        self.model = configure_model(lx_module)
+        self.model = configure_model(lx_module, config)
         self.prompt, self.examples = build_prompt(lx_module)
 
     def _build_extract_kwargs(self, text: str) -> Dict[str, Any]:
         kwargs: Dict[str, Any] = {
+            # 待抽取的原文文本
             "text_or_documents": text,
+            # 针对本任务定制的提示词
             "prompt_description": self.prompt,
+            # few-shot 示例，帮助模型理解字段格式
             "examples": self.examples,
-            "model": self.model,
+            # 允许多次抽取以提升召回
             "extraction_passes": self.config.extraction_passes,
+            # 控制单次推理的字符上限
             "max_char_buffer": self.config.max_char_buffer,
+            # 并发 worker 数，影响吞吐
             "max_workers": self.config.max_workers,
+            # 是否让 LangExtract 自动生成 schema 约束
             "use_schema_constraints": self.config.use_schema_constraints,
+            # 明确表示文本来自本地，不做网络抓取
             "fetch_urls": False,
         }
+        if self.model is not None:
+            kwargs["model"] = self.model
+        else:
+            kwargs["model_id"] = self.config.default_model_id
         if self.config.fence_output is not None:
             kwargs["fence_output"] = self.config.fence_output
         if self.config.resolver_params:
             kwargs["resolver_params"] = self.config.resolver_params
+        kwargs["debug"] = False
         return kwargs
 
     def extract_record(self, text: str) -> Dict[str, str]:
         annotated = self.lx.extract(**self._build_extract_kwargs(text))
+        self.lx.io.save_annotated_documents(
+            [annotated],
+            output_name="extraction_results_test.jsonl",
+            output_dir="."
+        )
+        if hasattr(annotated, 'extractions') and annotated.extractions:
+            print("\n" + "="*60)
+            print("📊 提取详情:")
+            print("="*60)
+            for i, ext in enumerate(annotated.extractions, 1):
+                print(f"\n{i}. {ext.extraction_class}")
+                print(f"   文本: {ext.extraction_text}")
+                print(f"   属性: {ext.attributes}")
+            
         documents = annotated if isinstance(annotated, list) else [annotated]
         record = {field: "" for field in FIELD_NAMES}
         for document in documents:
-            for extraction in iter_valid_extractions(document):
+            for extraction in getattr(document, "extractions", []) or []:
                 field_name = extraction.extraction_class
                 if field_name not in record or record[field_name]:
                     continue
@@ -296,7 +320,9 @@ def setup_logging(level: int) -> None:
         level=level,
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
     )
+    LOGGER.setLevel(CONFIG.log_level)
 
 
 def load_langextract() -> Any:
@@ -313,17 +339,11 @@ def run() -> None:
     setup_logging(CONFIG.log_level)
     lx_module = load_langextract()
     pipeline = LangExtractPipeline(lx_module, CONFIG)
+    active_model_id = getattr(pipeline.model, "model_id", None) or CONFIG.default_model_id
+    # 记录开始时间
+    start_time = time.time()
+    print(f"🚀 使用模型: {active_model_id}")
     records, stats = pipeline.process_documents()
-
-    if hasattr(records, 'extractions') and records.extractions:
-        print("\n" + "="*60)
-        print("📊 提取详情:")
-        print("="*60)
-        for i, ext in enumerate(records.extractions, 1):
-            print(f"\n{i}. {ext.extraction_class}")
-            print(f"   文本: {ext.extraction_text}")
-            print(f"   属性: {ext.attributes}")
-            
     if records:
         write_outputs(records, CONFIG.output_dir)
         LOGGER.info(
@@ -335,7 +355,10 @@ def run() -> None:
         LOGGER.info("结果已保存至 %s", CONFIG.output_dir.resolve())
     else:
         LOGGER.warning("未成功抽取任何记录，请检查输入数据或模型配置。")
-
+    # 记录结束时间
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    LOGGER.info("处理耗时: %.2f 秒", elapsed_time)  
 
 if __name__ == "__main__":
     run()

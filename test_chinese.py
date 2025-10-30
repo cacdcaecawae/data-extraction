@@ -167,10 +167,6 @@ def deduplicate_extractions(document):
 
 custom_model = configure_model()
 
-print("🚀 开始提取政府采购信息...")
-print(f"📄 输入文本:\n{input_text}\n")
-print("="*60)
-
 # 记录开始时间
 start_time = time.time()
 
@@ -180,6 +176,7 @@ result = lx.extract(
     prompt_description=prompt,
     examples=examples,
     model_id="gemini-2.5-flash",
+    debug=True,
 )
 
 # 记录结束时间
