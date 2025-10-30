@@ -63,7 +63,7 @@ EXAMPLE_LINES: Sequence[Tuple[str, str]] = (
     ("供应商名称", "某某建设有限公司"),
     ("供应商地址", "某市高新区产业园一区"),
     ("中标金额", "1980000元"),
-    ("采购类别", "服务"),
+    ("采购类别", "服务类"),
     ("采购标的", "城市道路日常维护服务"),
 )
 
@@ -78,7 +78,7 @@ if absl_logging is not None:
 
 @dataclass
 class PipelineConfig:
-    input_dir: Path = Path("./data1")
+    input_dir: Path = Path("./data")
     output_dir: Path = field(
         default_factory=lambda: Path("./result") / datetime.now().strftime("%Y%m%d_%H%M%S")
     )
@@ -130,7 +130,16 @@ def build_prompt(lx_module: Any) -> Tuple[str, Sequence[Any]]:
     prompt = (
         "请从政府采购公告中提取以下字段："
         f"{field_list}。"
-        "每个字段最多输出一条 extraction，字段名称写入 extraction_class。"
+        "\n- 公告时间：公告发布日期时间（YYYY年MM月DD日 HH:MM格式），优先提取“公告时间 |”后的完整时间"
+        "\n- 项目名称：完整的采购项目名称（优先从“采购项目名称 |”或“二、项目名称：”提取）"
+        "\n- 采购单位名称：发起采购的机构全称（优先从“采购单位 |”提取）"
+        "\n- 采购单位地址：采购单位完整地址（优先从“采购单位地址 |”提取，需包含门牌号）"
+        "\n- 供应商名称：中标供应商全称（从“采购结果”的表格提取），多个请用；隔开"
+        "\n- 供应商地址：中标供应商完整地址（从采购结果表格中对应行提取），多个请用；隔开"
+        "\n- 中标金额：总中标金额（从“总中标金额 |”提取，仅包含数字和单位即可）"
+        "\n- 采购类别：品目类别（如“服务类”“货物类”以及“工程类”，从主要标的信息部分提取，多个请用；隔开）"
+        "\n- 采购标的：具体采购内容（主要从“采购标的”列提取，从主要标的信息部分提取，如“农畜产品批发服务”，多个请用；隔开）"
+        "\n每个字段最多输出一条 extraction，字段名称写入 extraction_class。"
         "extraction_text 必须来自公告原文的连续片段；缺失则留空。"
     )
     example_text = "\n".join(f"{key}：{value}" for key, value in EXAMPLE_LINES)
@@ -191,7 +200,7 @@ class LangExtractPipeline:
             # 允许多次抽取以提升召回
             "extraction_passes": self.config.extraction_passes,
             # 控制单次推理的字符上限
-            "max_char_buffer": self.config.max_char_buffer,
+            "max_char_buffer": max(len(text), self.config.max_char_buffer),
             # 并发 worker 数，影响吞吐
             "max_workers": self.config.max_workers,
             # 是否让 LangExtract 自动生成 schema 约束
