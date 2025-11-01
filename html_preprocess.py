@@ -11,6 +11,10 @@ from typing import Iterable, Iterator, List, Optional, Sequence, Tuple
 
 from bs4 import BeautifulSoup
 from bs4.element import Comment
+try:
+    from markdownify import markdownify as to_markdown
+except ImportError:  # pragma: no cover - lazy optional dependency
+    to_markdown = None
 
 LOGGER = logging.getLogger(__name__)
 
@@ -18,7 +22,7 @@ LOGGER = logging.getLogger(__name__)
 DEFAULT_ENCODINGS: Sequence[str] = ("utf-8", "gb18030", "gbk", "gb2312")
 
 # 常见的 HTML 文件后缀匹配模式。
-DEFAULT_PATTERNS: Sequence[str] = ("*.html", "*.htm", "*.shtml", "*.xhtml", "*.htm*")
+DEFAULT_PATTERNS: Sequence[str] = ("*.html", "*.htm", "*.shtml", "*.xhtml")
 
 
 def strip_bom(text: str) -> str:
@@ -66,7 +70,9 @@ def html_to_text(
     drop_empty_lines: bool = True,
     table_cell_sep: str = " | ",
 ) -> str:
-    """Convert raw HTML markup into plain text suitable for LLM extraction."""
+    """Convert raw HTML markup into Markdown text suitable for LLM extraction."""
+    if to_markdown is None:
+        raise RuntimeError("未安装 markdownify，请先执行 `pip install markdownify`。")
     soup = BeautifulSoup(html, "lxml")
 
     # 移除脚本、样式、模板等非正文节点。
@@ -75,34 +81,87 @@ def html_to_text(
     for comment in soup.find_all(string=lambda item: isinstance(item, Comment)):
         comment.extract()
 
-    # 将表格结构转换为易读的行列表示，保留列之间的对应关系。
+    # 将表格结构转换为 Markdown 风格，保留列之间的对应关系。
     for table in soup.find_all("table"):
-        lines: list[str] = []
+        row_values: list[list[str]] = []
         for tr in table.find_all("tr"):
             cells = tr.find_all(["th", "td"])
             if not cells:
                 continue
-            values = [
-                normalize_whitespace(
-                    cell.get_text(separator=" ", strip=True)
-                )
+            values: list[str] = [
+                normalize_whitespace(cell.get_text(separator=" ", strip=True))
                 for cell in cells
             ]
             if not any(values):
                 continue
-            lines.append(table_cell_sep.join(values))
+            row_values.append(values)
 
-        table_text = separator.join(lines).strip()
+        if row_values:
+            joiner = table_cell_sep if table_cell_sep else " | "
+
+            def format_row(cells: list[str]) -> str:
+                return "| " + joiner.join(cells) + " |"
+
+            header = format_row(row_values[0])
+            column_count = max(len(row_values[0]), 1)
+            divider = "| " + " | ".join("---" for _ in range(column_count)) + " |"
+            body_rows = [format_row(row) for row in row_values[1:]]
+            table_lines = [header, divider, *body_rows]
+            table_text = "\n".join(table_lines)
+        else:
+            table_text = ""
         replacement = soup.new_string(table_text) if table_text else soup.new_string("")
         table.replace_with(replacement)
 
-    text = soup.get_text(separator=separator)
-    lines = []
-    for raw_line in text.splitlines():
-        cleaned = normalize_whitespace(raw_line)
-        if drop_empty_lines and not cleaned:
-            continue
-        lines.append(cleaned)
+    markdown = to_markdown(
+        str(soup),
+        heading_style="ATX",
+        strip=["script", "style", "template", "noscript"],
+        bullets="*",
+    ).strip()
+
+    def _clean_line(line: str) -> str:
+        # 保留 Markdown 语法同时移除常见不可见字符。
+        cleaned = line.replace("\u00a0", " ").replace("\u3000", " ")
+        return cleaned.rstrip()
+
+    lines = [_clean_line(line) for line in markdown.splitlines()]
+    if drop_empty_lines:
+        lines = [line for line in lines if line.strip()]
+    text = separator.join(lines).strip()
+    return _trim_markdown_sections(text, separator=separator)
+
+
+def _trim_markdown_sections(
+    text: str,
+    *,
+    heading_prefix: str = "##",
+    end_marker: str = "请按以下方式联系",
+    separator: str = "\n",
+) -> str:
+    """Keep useful body by trimming boilerplate before/after markers."""
+    if not text:
+        return text
+
+    lines = text.split(separator)
+
+    start_index: Optional[int] = None
+    for idx, line in enumerate(lines):
+        stripped = line.lstrip()
+        if stripped.startswith(f"{heading_prefix} "):
+            start_index = idx
+            break
+    if start_index is not None:
+        lines = lines[start_index:]
+
+    end_index: Optional[int] = None
+    for idx, line in enumerate(lines):
+        if end_marker in line:
+            end_index = idx
+            break
+    if end_index is not None:
+        lines = lines[:end_index]
+
     return separator.join(lines).strip()
 
 
@@ -130,13 +189,9 @@ def collect_html_paths(
     patterns: Sequence[str] = DEFAULT_PATTERNS,
 ) -> List[Path]:
     """Return a de-duplicated, sorted list of HTML-like files under ``root``."""
-    seen_paths: set[Path] = set()
     files: List[Path] = []
     for pattern in patterns:
         for path in sorted(root.rglob(pattern)):
-            if path in seen_paths:
-                continue
-            seen_paths.add(path)
             files.append(path)
     return files
 

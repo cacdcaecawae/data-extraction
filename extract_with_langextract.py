@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-import csv
+import csv,os
 import json
 import logging
 import sys
@@ -37,9 +37,9 @@ except ImportError:  # pragma: no cover - absl 非必需依赖
 LOGGER = logging.getLogger("langextract_pipeline")
 
 MODEL_ID = "deepseek-chat"
-API_KEY = "sk-2895a83fa10c49eeb262f6c5139ad423"
+API_KEY = os.environ.get('DEEPSEEK_API_KEY')
 BASE_URL = "https://api.deepseek.com"
-MODEL_TEMPERATURE = 0.1  # 低温度让输出更加稳定
+MODEL_TEMPERATURE = 0  # 低温度让输出更加稳定
 
 FIELD_NAMES: Sequence[str] = (
     "公告时间",
@@ -96,7 +96,7 @@ class PipelineConfig:
     table_cell_sep: str = " | "
     fail_silently: bool = False
     default_model_id: str = "gemini-2.5-flash"
-    use_custom_model: bool = False
+    use_custom_model: bool = True
 
 
 CONFIG = PipelineConfig()
@@ -139,8 +139,7 @@ def build_prompt(lx_module: Any) -> Tuple[str, Sequence[Any]]:
         "\n- 中标金额：总中标金额（从“总中标金额 |”提取，仅包含数字和单位即可）"
         "\n- 采购类别：品目类别（如“服务类”“货物类”以及“工程类”，从主要标的信息部分提取，多个请用；隔开）"
         "\n- 采购标的：具体采购内容（主要从“采购标的”列提取，从主要标的信息部分提取，如“农畜产品批发服务”，多个请用；隔开）"
-        "\n每个字段最多输出一条 extraction，字段名称写入 extraction_class。"
-        "extraction_text 必须来自公告原文的连续片段；缺失则留空。"
+        "\n每个字段最多输出一条，且必须来自公告原文的连续片段；缺失则留空。"
     )
     example_text = "\n".join(f"{key}：{value}" for key, value in EXAMPLE_LINES)
     example_extractions = [
@@ -200,7 +199,7 @@ class LangExtractPipeline:
             # 允许多次抽取以提升召回
             "extraction_passes": self.config.extraction_passes,
             # 控制单次推理的字符上限
-            "max_char_buffer": max(len(text), self.config.max_char_buffer),
+            "max_char_buffer": len(text),
             # 并发 worker 数，影响吞吐
             "max_workers": self.config.max_workers,
             # 是否让 LangExtract 自动生成 schema 约束
