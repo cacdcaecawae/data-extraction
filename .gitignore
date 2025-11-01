@@ -3,7 +3,7 @@
 
 # 但保留 .py 文件
 !*.py
-
+!*.md
 # 保留 .gitignore 本身
 !.gitignore
 
@@ -32,3 +32,19 @@ ENV/
 
 # 忽略 Jupyter Notebook 检查点
 .ipynb_checkpoints/
+
+# 忽略环境变量文件和敏感信息
+.env
+.env.local
+*.key
+
+# 忽略输出结果
+result/
+langextract_jsonl/
+html2md/
+*.jsonl
+*.xlsx
+*.csv
+extraction_results_*.jsonl
+visualization_*.html
+test_output.txt

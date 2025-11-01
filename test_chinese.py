@@ -3,7 +3,7 @@ from langextract.data import ExampleData, Extraction
 from langextract.providers.openai import OpenAILanguageModel
 import textwrap
 import time
-
+import os
 # 1. 定义提取规则 - 中文政府采购信息
 prompt = textwrap.dedent("""\
     从政府采购公告中提取关键信息。每个字段类型只提取一次，返回最权威、最完整的值。
@@ -112,7 +112,7 @@ with open("test_output.txt", "r", encoding="utf-8") as f:
 
 # 4. 配置 DeepSeek 模型
 MODEL_ID = "deepseek-chat"
-API_KEY = "sk-2895a83fa10c49eeb262f6c5139ad423"
+API_KEY = os.environ.get('DEEPSEEK_API_KEY')
 BASE_URL = "https://api.deepseek.com"
 MODEL_TEMPERATURE = 0.1  # Low temperature keeps output stable
 MODEL_FORMAT = lx.data.FormatType.JSON

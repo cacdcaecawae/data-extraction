@@ -218,12 +218,14 @@ class LangExtractPipeline:
         kwargs["debug"] = False
         return kwargs
 
-    def extract_record(self, text: str) -> Dict[str, str]:
+    def extract_record(self, text: str, *, folder_name: str) -> Dict[str, str]:
         annotated = self.lx.extract(**self._build_extract_kwargs(text))
+        output_dir = Path("./langextract_jsonl")
+        output_dir.mkdir(parents=True, exist_ok=True)
         self.lx.io.save_annotated_documents(
             [annotated],
-            output_name="extraction_results_test.jsonl",
-            output_dir="."
+            output_name=f"{folder_name}.jsonl",
+            output_dir=str(output_dir)
         )
         if hasattr(annotated, 'extractions') and annotated.extractions:
             print("\n" + "="*60)
@@ -248,18 +250,31 @@ class LangExtractPipeline:
         stats = PipelineStats()
         records: List[Dict[str, str]] = []
 
-        files = collect_html_paths(self.config.input_dir, patterns=self.config.patterns)
+        announcement_dirs = sorted(
+            [path for path in self.config.input_dir.iterdir() if path.is_dir()]
+        )
+        folder_count = len(announcement_dirs)
+
+        if folder_count == 0:
+            LOGGER.info("未检测到任何公告文件夹，请检查输入目录 %s", self.config.input_dir)
+            return records, stats
+
+        files: List[Tuple[Path, Path]] = []
+        for folder in announcement_dirs:
+            folder_files = collect_html_paths(folder, patterns=self.config.patterns)
+            for html_path in folder_files:
+                files.append((folder, html_path))
+
         stats.total = len(files)
 
         if stats.total == 0:
-            LOGGER.info("未检测到可处理的 HTML 文件，提前退出。")
+            LOGGER.info("公告文件夹内没有发现 HTML 文件，请检查数据内容")
             return records, stats
 
-        LOGGER.info("本次共有 %d 个文件待处理", stats.total)
-        print(f"📂 本次检测到 {stats.total} 个 HTML 文件，开始执行抽取...")
+        print(f"本次处理 {stats.total} 个 HTML 文件，涉及 {folder_count} 个公告文件夹")
         progress = ProgressBar(stats.total)
 
-        for index, path in enumerate(files, start=1):
+        for index, (folder, path) in enumerate(files, start=1):
             try:
                 text = convert_html_file(
                     path,
@@ -276,7 +291,7 @@ class LangExtractPipeline:
                     LOGGER.exception("预处理失败：%s", path)
             else:
                 try:
-                    record = self.extract_record(text)
+                    record = self.extract_record(text, folder_name=folder.name)
                 except Exception:  # pylint: disable=broad-except
                     stats.failed += 1
                     LOGGER.exception("抽取失败：%s", path)
@@ -289,7 +304,6 @@ class LangExtractPipeline:
 
         progress.finish()
         return records, stats
-
 
 def write_outputs(records: Sequence[Dict[str, str]], output_dir: Path) -> None:
     """将抽取结果写入 CSV / JSONL / XLSX。"""
